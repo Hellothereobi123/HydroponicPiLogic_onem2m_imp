@@ -816,3 +816,34 @@ then `test_ph_sync.py` for a real end-to-end reading.
   history wasn't copied; earlier entries above describe that repository's history.
 - Some docs still name the old repository (`HydroponicPiLogic_onem2m`), e.g. the README's clone
   command.
+
+## 2026-11-18 (separate entry points for real and dummy data)
+- **Two entry points running the same loop:**
+  - `pi/main_real.py`: the real sensors.
+  - `pi/main_dummy.py`: simulated sensors, no hardware needed, on a Pi or a PC.
+
+  With `HYDRO_BACKEND=onem2m`, both also run the oneM2M uploader (uploads + on-demand requests)
+  in a background thread of the same process, so one command does everything. If the
+  uploader crashes it restarts after 10 s; a config error stops it for good. `--no-uploader`
+  leaves uploads to `hydro-onem2m.service`.
+- `pi/loop.py`: the sensor loop moved out of `main.py` unchanged (`_read_trusted`,
+  `read_all`, `sync_pending`), plus `start_onem2m_uploader()` and `run()`. Both entry points use
+  it, so dummy runs exercise the real validity checks, fan control and storage.
+- `pi/main.py` stays as `hydro-sensors.service`'s entry point: now `main_real.py --no-uploader`.
+  It still exports `build_sensors` for `read_sensors.py`, so existing installs are unaffected.
+- `pi/sensors/dummy.py`: simulated sensors with the real names and units. Values are plausible,
+  with a daily light cycle, and noise keeps the "stuck probe" check from firing; they pass every
+  validity rule.
+- **Dummy data never mixes with real data.** `main_dummy.py` sets `HYDRO_DUMMY=1` before
+  `config` loads, so `config.py` uses `hydro_dummy.db` and device name `HydroPi-<hash>-sim`; a
+  friendly `HYDRO_SYSTEM_NAME` gets " (sim)". It never syncs to Supabase. On an empty database
+  it seeds `--seed-days` (default 3) of history, with only the last `--upload-hours` (default 2)
+  uploaded to the CSE.
+- Tested on Windows:
+  - `main_dummy.py` against a local ACME: seeded 972 cycles; when the CSE came up its uploader
+    reconnected by itself, provisioned `HydroPi-9f2a2854-sim` and uploaded 139 cycles.
+  - The app's discovery and live window saw the `-sim` system; a 7-day history request was
+    answered from the same process in 2 s (73 records).
+  - `main_real.py` without hardware logged each missing sensor as a fault, stored the cycle and
+    kept running. The `main.py` shim works.
+- Not tested on a real Pi.

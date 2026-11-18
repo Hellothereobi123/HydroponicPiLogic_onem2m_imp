@@ -46,7 +46,11 @@ cse-hydropi
 
 | Path | What it is |
 |---|---|
-| `pi/main.py` | Main loop: read sensors, validity checks, fan control, save to SQLite, Supabase sync in supabase mode |
+| `pi/main_real.py` | **Run with the real sensors.** The sensor loop, plus the oneM2M uploader in the same process (`--no-uploader` to leave that to `hydro-onem2m.service`) |
+| `pi/main_dummy.py` | **Run with simulated sensors** (no hardware, on a Pi or a PC). Same loop and uploader, with its own database (`hydro_dummy.db`) and device name (`HydroPi-<hash>-sim`); seeds 3 days of history; never uploads to Supabase |
+| `pi/main.py` | Entry point of `hydro-sensors.service`: `main_real.py --no-uploader` |
+| `pi/loop.py` | The sensor loop both use: read sensors, validity checks, fan control, save to SQLite, Supabase sync in supabase mode |
+| `pi/sensors/dummy.py` | The simulated sensors: same names and units, plausible values with a daily light cycle |
 | `pi/config.py` | All settings: pins, intervals, ranges, device name, backend choice, oneM2M settings |
 | `pi/db.py` | SQLite schema, migrations and the upload queues |
 | `pi/sensors/` | Sensor drivers (ADS1115 pH/EC, SCD4x CO₂, VEML7700 light, DS18B20 water temp, Edenic EC, water level) |
@@ -97,13 +101,43 @@ sudo systemctl enable --now hydro-sensors hydro-ble acme-cse hydro-onem2m
 ```
 
 Check it with `journalctl -u hydro-onem2m -f`: it prints `provisioned` and then
-`uploaded N cycle(s)`. `main.py` prints the Pi's name (`HydroPi-...`) at startup.
+`uploaded N cycle(s)`. The sensor loop prints the Pi's name (`HydroPi-...`) at startup.
 
 In the app, open **⚙ oneM2M settings** and enter `http://<Pi's LAN IP>:8080` and the app's token.
 The phone must be on the same network as the Pi.
 
 For the Supabase backend instead, leave `HYDRO_BACKEND=supabase`, fill in `SUPABASE_URL` and
 `SUPABASE_KEY`, and skip ACME, `acme-cse` and `hydro-onem2m`.
+
+## Running it: real or dummy data
+
+Two entry points run the same loop (`pi/loop.py`), from the `pi/` folder:
+
+```bash
+python3 main_real.py      # real sensors
+python3 main_dummy.py     # simulated sensors: test without hardware, on a Pi or a PC
+```
+
+Each, every 30 s, reads every sensor, checks it, drives the fans and saves the cycle. With
+`HYDRO_BACKEND=onem2m` it also runs the oneM2M uploader in the same process: uploads, plus
+answering the app's 24 h / 7 days requests. So one command does everything. Settings come from
+`pi/.env` as usual (`ONEM2M_CSE_URL`, `ONEM2M_TRANSPORT`, …).
+
+| | `main_real.py` | `main_dummy.py` |
+|---|---|---|
+| Sensors | The real ones (`sensors/`) | Simulated (`sensors/dummy.py`) |
+| Database | `hydro.db` | `hydro_dummy.db` |
+| Device / system name | `HydroPi-<hash>` | `HydroPi-<hash>-sim`, a separate system in the app |
+| Supabase | Synced every 5 min (supabase backend) | Never: dummy data stays local |
+| History | What the Pi has recorded | 3 days seeded on first run (`--seed-days`, `0` for none); the last 2 h are uploaded (`--upload-hours`) |
+
+`--no-uploader` on either leaves the oneM2M uploads to a separate `hydro-onem2m.service`.
+That's how the installed services run it: `hydro-sensors.service` starts `main.py`, which is
+`main_real.py --no-uploader`. To run everything as one service instead, point
+`hydro-sensors.service` at `main_real.py` and don't enable `hydro-onem2m`.
+
+Dummy and real data never mix, so a Pi can run `main_dummy.py` for a demo and switch back to
+`main_real.py` without cleanup. Delete `hydro_dummy.db` to start the dummy history again.
 
 ## Testing without a Pi
 

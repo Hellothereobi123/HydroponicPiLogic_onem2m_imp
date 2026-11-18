@@ -8,6 +8,12 @@ from dotenv import load_dotenv
 
 load_dotenv()  # picks up a local .env file if present, no-op otherwise
 
+# --- Dummy mode ---
+# main_dummy.py sets HYDRO_DUMMY=1 before anything imports this file: simulated sensors, plus a
+# separate database (DB_PATH) and device name (DEVICE_NAME + "-sim"), so dummy data can never
+# mix with a real Pi's data, locally or on the CSE.
+DUMMY = os.environ.get("HYDRO_DUMMY", "").strip() == "1"
+
 # --- Timing ---
 SAMPLE_INTERVAL_S = 30      # how often every sensor is read
 SYNC_INTERVAL_S = 300       # how often readings are pushed out and the local table is cleared
@@ -114,7 +120,7 @@ VEML7700_INTEGRATION_MS = 100   # one of 25, 50, 100, 200, 400, 800
 # not a slope we fit ourselves, so there is no EC equivalent of calibrate_ph.py.
 
 # --- SQLite ---
-DB_PATH = "hydro.db"
+DB_PATH = "hydro_dummy.db" if DUMMY else "hydro.db"
 SYNC_BATCH_LIMIT = 300      # rows per request; spec §8 caps a push at a few hundred
 SQLITE_BUSY_TIMEOUT_S = 2   # wait out a brief lock instead of erroring; every process sets it
 
@@ -237,12 +243,18 @@ def device_name(hw_id: str) -> str:
 
 
 DEVICE_ID_SOURCE, _DEVICE_ID = hardware_id()
-DEVICE_NAME = device_name(_DEVICE_ID)  # also the Bluetooth advertised name
+# Also the Bluetooth advertised name and the oneM2M AE name. Dummy mode gets its own (-sim), so
+# its AE and readings stay apart from the real Pi's (still CHydroPi-*, so the CSE accepts it).
+DEVICE_NAME = device_name(_DEVICE_ID) + ("-sim" if DUMMY else "")
 
 # Which growing system this Pi belongs to, written to `system_name` on every row (Supabase and
 # BLE). The app builds one system per distinct name, so each Pi needs its own: by default its
 # DEVICE_NAME. Set HYDRO_SYSTEM_NAME in .env for a friendly name such as "Tower A" instead.
-SYSTEM_NAME = os.environ.get("HYDRO_SYSTEM_NAME") or DEVICE_NAME
+# In dummy mode a friendly name gets " (sim)" so the app shows it as a separate system.
+_FRIENDLY_NAME = os.environ.get("HYDRO_SYSTEM_NAME")
+if _FRIENDLY_NAME and DUMMY:
+    _FRIENDLY_NAME += " (sim)"
+SYSTEM_NAME = _FRIENDLY_NAME or DEVICE_NAME
 
 # Placeholder for the remote `username` column, which no sensor provides. The app shows a
 # signed-in user only the rows tagged with their username, so untagged rows never appear. There
