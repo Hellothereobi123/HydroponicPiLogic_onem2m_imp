@@ -1,0 +1,23 @@
+# Uploads stored readings to the oneM2M CSE (HYDRO_BACKEND=onem2m only). Separate from
+# hydro-sensors so CSE trouble can never delay sampling; readings wait in SQLite until the CSE
+# accepts them. Install alongside acme-cse.service (see that file).
+
+[Unit]
+Description=Hydroponic oneM2M uploader (AE)
+After=acme-cse.service
+Wants=acme-cse.service
+
+[Service]
+Type=simple
+User=pi
+# DB_PATH is relative: must run from pi/ to use the real hydro.db
+WorkingDirectory=/home/pi/HydroponicPiLogic/pi
+ExecStart=/home/pi/HydroponicPiLogic/pi/.venv/bin/python onem2m_sync.py
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

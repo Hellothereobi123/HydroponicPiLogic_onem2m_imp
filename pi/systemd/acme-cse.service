@@ -1,0 +1,30 @@
+# ACME oneM2M CSE on the Pi (oneM2M backend only). Install with:
+#   sudo cp systemd/acme-cse.service systemd/hydro-onem2m.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now acme-cse hydro-onem2m
+# ACME has its own venv (it pulls in many packages the sensor code doesn't need):
+#   python3 -m venv /home/pi/acme-venv && /home/pi/acme-venv/bin/pip install acmecse
+# Adjust User/paths if the Pi's username or clone location differ. See docs/onem2m.md.
+
+[Unit]
+Description=ACME oneM2M CSE (HydroPi)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+# ACME reads acme.ini and .env from its base directory and keeps data/ and logs/ there
+WorkingDirectory=/home/pi/HydroponicPiLogic/acme
+ExecStart=/home/pi/acme-venv/bin/acmecse --config acme.ini --base-directory /home/pi/HydroponicPiLogic/acme --headless --no-mqtt --no-coap --no-ws
+Restart=always
+RestartSec=5
+
+# Below the sensor loop, which must never miss a reading. A slow CSE only delays uploads;
+# the readings wait safely in SQLite.
+Nice=5
+MemoryMax=300M
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,343 @@
+"""Central config for the Pi control subsystem. Tune values here, not in the modules."""
+
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # picks up a local .env file if present, no-op otherwise
+
+# --- Timing ---
+SAMPLE_INTERVAL_S = 30      # how often every sensor is read
+SYNC_INTERVAL_S = 300       # how often readings are pushed out and the local table is cleared
+
+# --- Basins ---
+# EC/pH/water level live on the shared reservoir. Everything else is per-basin.
+MASTER_BASIN = "master"
+BASIN_IDS = ["basin_1"]     # add one entry per physical basin as they come online
+
+# --- Sensor validity (spec §4) ---
+# Ranges are "is this physically plausible", deliberately wider than the control setpoints in
+# §5: a reading can be valid and still be wrong for lettuce. pH 3-9 and EC 0-5 are from the
+# spec; the rest bound what the hardware can legitimately report.
+# max_change_per_s catches a probe jumping rather than drifting. Spec §4 gives pH as >1.5
+# units in 30s, which is 0.05/s.
+VALIDITY_RULES = {
+    "ph":          {"min": 3.0, "max": 9.0, "max_change_per_s": 0.05},
+    "ec":          {"min": 0.0, "max": 5.0, "max_change_per_s": 0.1},
+    "temperature": {"min": 0.0, "max": 40.0},
+    "water_temp":  {"min": 0.0, "max": 40.0},
+    "humidity":    {"min": 0.0, "max": 100.0},
+    "co2":         {"min": 0.0, "max": 10000.0},
+    "light":       {"min": 0.0, "max": 150000.0},
+    # Binary by nature, so it would always look "stuck" and can never drift.
+    "water_level": {"min": 0.0, "max": 1.0, "stuck_check": False},
+}
+STUCK_READING_COUNT = 20    # identical readings in a row before calling a probe dead
+STUCK_VALUE_DECIMALS = 4    # spec §4: "identical value to 4 dp"
+
+# --- Fan feedback loop (bang-bang, per basin) ---
+FAN_ON_TEMP_F = 72.0
+FAN_OFF_TEMP_F = 58.0
+
+# --- ADC (Adafruit ADS1115) ---
+# The Pi has no analog inputs, so analog probes are read through this I2C ADC.
+ADS1115_ADDRESS = 0x48      # ADDR pin to GND / unconnected; 0x49-0x4B if rewired
+ADS1115_PGA = 1             # +/-4.096V full scale, covers the pH board's output swing
+PH_ADC_CHANNEL = 0          # A0
+
+# --- pH probe (DFRobot SEN0161/SEN0169 analog board) ---
+# pH is linear in the board's output voltage: pH = PH_SLOPE * volts + PH_INTERCEPT.
+# 3.5 / 0.0 are DFRobot's defaults for an UNCALIBRATED board — readings will be plausible
+# but wrong until these are replaced with what calibrate_ph.py prints.
+PH_SLOPE = 3.5
+PH_INTERCEPT = 0.0
+PH_SAMPLES_PER_READ = 5     # median of N ADC reads; raw analog pH output is noisy
+
+# --- EC (Bluelab Guardian via the Edenic cloud API) ---
+# Replaces the analog SenseCAP probe. The API key is a secret and lives in .env, never here.
+# Note Edenic API keys expire after one year — EC will silently start faulting when it does.
+EDENIC_API_BASE_URL = "https://api.edenic.io/api/v1"
+EDENIC_API_KEY = os.environ.get("EDENIC_API_KEY", "")
+EDENIC_ORGANIZATION_ID = os.environ.get("EDENIC_ORGANIZATION_ID", "")
+EDENIC_DEVICE_ID = os.environ.get("EDENIC_DEVICE_ID", "")
+# Edenic rate-limits to about one request per minute, while the loop samples every 30s, so
+# responses are cached for this long and served from cache in between.
+EDENIC_MIN_POLL_S = 60
+EDENIC_REQUEST_TIMEOUT_S = 10
+EDENIC_EC_KEY = "electrical_conductivity"   # already mS/cm, matching our unit
+
+# --- EC probe (SenseCAP S-EC-01, analog) — superseded by the Guardian above, kept in case
+# the analog path is revived. Nothing reads these while ECSensor uses Edenic. ---
+EC_ADC_CHANNEL = 1          # A1
+
+# The volts -> uS/cm multiplier depends on which output range the unit was ordered with, and
+# getting it wrong scales every reading by up to 10x. Datasheet section 6:
+#     0-2000 uS/cm  -> 1000      0-5000 uS/cm  -> 2500
+#     0-10000 uS/cm -> 5000      0-20000 uS/cm -> 10000
+# Confirm empirically: in 1413 uS/cm calibration solution the output should read
+#     1.413V (1000) | 0.565V (2500) | 0.283V (5000) | 0.141V (10000)
+# Those are far enough apart to be unambiguous — use read_adc.py to check.
+EC_VOLTS_TO_US_CM = 1000
+EC_SAMPLES_PER_READ = 5
+
+# --- Water level (DFRobot SEN0204 / XKC-Y25-T12V non-contact detector) ---
+# DANGER: this sensor's output swings to its supply voltage, and it needs 5V minimum. Its OUT
+# pin therefore sits at 5V, which will damage a Pi GPIO — the Pi is not 5V tolerant. A level
+# shifter or a divider (e.g. 10k from OUT to the GPIO, 20k from the GPIO to GND, giving 3.3V)
+# is REQUIRED, not optional. See PROGRESS.md.
+#
+# It is also a point detector, not a gauge: HIGH means liquid is present at the height it is
+# mounted at, LOW means it is not. It cannot report a percentage, which is what spec §5
+# assumes. One unit gives a single threshold; more units at different heights give more bands.
+WATER_LEVEL_GPIO_PIN = 17   # BCM numbering
+
+# --- Water temperature (DS18B20, 1-Wire) ---
+# Needs 1-Wire enabled: `sudo raspi-config nonint do_onewire 0` then reboot, plus the 4.7k
+# pullup from DATA to VCC that ships with the probe. 3.0-5.5V, so run it from 3.3V and the
+# data line is already Pi-safe — no divider needed, unlike the level sensor.
+# Empty dict = auto-detect, which only works with exactly one probe on the bus. With more than
+# one, map each basin to its probe's factory id (run `ls /sys/bus/w1/devices/` to list them).
+WATER_TEMP_DEVICE_IDS: dict[str, str] = {}
+
+# --- Light (Adafruit VEML7700, I2C 0x10) ---
+# Gain and integration time trade range against resolution. 1/8 and 100ms is the library
+# default and tops out near 30k lux; grow lights at canopy can exceed that, in which case the
+# driver raises rather than silently reporting a saturated value. Drop to 25ms for more range.
+VEML7700_GAIN = 0.125       # one of 0.125, 0.25, 1, 2
+VEML7700_INTEGRATION_MS = 100   # one of 25, 50, 100, 200, 400, 800
+
+# The sensor applies its own temperature compensation internally (2%/degC by default), which
+# is what spec §4 requires — so unlike the EZO plan, nothing needs doing in software here.
+# Calibration is also on-device (buttons SW2/SW3 against 1413 and 12880 uS/cm solutions),
+# not a slope we fit ourselves, so there is no EC equivalent of calibrate_ph.py.
+
+# --- SQLite ---
+DB_PATH = "hydro.db"
+SYNC_BATCH_LIMIT = 300      # rows per request; spec §8 caps a push at a few hundred
+SQLITE_BUSY_TIMEOUT_S = 2   # wait out a brief lock instead of erroring; every process sets it
+
+# --- Shared schema ---
+# Local sensor name -> the column the app knows it by. Used by BOTH the Supabase sync and the
+# BLE server, so the two paths cannot drift into reporting the same reading under different
+# names.
+REMOTE_COLUMNS = {
+    "ph": "ph",
+    "ec": "ec",
+    "temperature": "temperature_c",
+    "humidity": "humidity",
+    "light": "light_intensity",
+    "co2": "co2",
+    "water_temp": "water_temp",
+    "water_level": "water_level",
+}
+
+# Local columns that hold a boolean as 0.0/1.0 (SQLite stores every sensor as REAL) and must
+# leave the Pi as true/false. `water_level` is the SEN0204, now mounted at the low-water mark:
+# true means water is at the sensor (normal), false means the level has dropped below it.
+BOOLEAN_COLUMNS = {"water_level"}
+
+# Local columns sent as whole numbers. The remote `co2` column is bigint (the CSV import that
+# recreated the table inferred it from whole-number values), and Postgres rejects "445.0" for a
+# bigint, failing the whole batch. The SCD41 only reports whole ppm, so nothing is lost.
+INTEGER_COLUMNS = {"co2"}
+
+
+def remote_value(local: str, value):
+    """A local value as it should appear remotely (Supabase and BLE): booleans as true/false,
+    whole-number columns as ints."""
+    if value is None:
+        return None
+    if local in BOOLEAN_COLUMNS:
+        return value >= 0.5
+    if local in INTEGER_COLUMNS:
+        return int(round(value))
+    return value
+
+# --- BLE ---
+# Fixed UUIDs. The app hard-codes these same values; see docs/ble-protocol.md.
+BLE_SERVICE_UUID = "6e3a1f80-5c21-4a7e-9d1b-2f8c4a0e7b31"
+BLE_CONTROL_UUID = "6e3a1f81-5c21-4a7e-9d1b-2f8c4a0e7b31"
+BLE_DATA_UUID = "6e3a1f82-5c21-4a7e-9d1b-2f8c4a0e7b31"
+BLE_DEVICE_PREFIX = "HydroPi"
+BLE_NOTIFY_GAP_S = 0.02     # pacing so Android's notification queue does not drop messages
+BLE_MAX_ROWS = 50           # ceiling on what one GET may ask for
+BLE_STALE_AFTER_S = 180     # readings older than this mean the sensor loop has stalled
+
+# --- Supabase / app transmission ---
+# Never hardcode these. Set them in a local .env (see .env.example) or the Pi's environment.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+# Remote table: one wide row per snapshot. Columns as of 2026-11-09 (after a CSV import
+# recreated it): id, recorded_at, ph, ec, water_temp, temperature_c, humidity, light_intensity,
+# co2 (bigint), username, water_level, system_name. Sensor columns come from REMOTE_COLUMNS;
+# username and system_name are filled from the settings below; id is left to the database.
+SUPABASE_READINGS_TABLE = "sensor_readings"
+
+# --- Device identity ---
+# Each Pi names itself HydroPi-<first 8 hex digits of SHA-256 of its hardware id>, e.g.
+# HydroPi-3f9a0c12. The id is the SoC serial number burned in at the factory, so the name is
+# unique per board, needs no setup, and survives reflashing the SD card. It identifies the Pi;
+# it is not a secret (Pi serials are guessable, so the hash can be reversed by brute force).
+DEVICE_HASH_LENGTH = 8
+
+# Places a stable unique id can come from, most preferred first. The Pi's serial is in the
+# device tree on Pi 4 and Pi 5; /proc/cpuinfo carries the same value on most kernels.
+_SERIAL_PATHS = ("/sys/firmware/devicetree/base/serial-number", "/proc/device-tree/serial-number")
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="ascii", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _usable(value: str) -> bool:
+    """Empty or all-zero ids (some VMs and boards report 0000...) cannot tell devices apart."""
+    return bool(value) and value.strip("0") != ""
+
+
+def hardware_id() -> tuple[str, str]:
+    """(source, value) of the most stable unique id available on this machine.
+
+    On a Pi this is the SoC serial. The fallbacks exist so the code still runs on a laptop or
+    another Linux box during development: /etc/machine-id (changes if the OS is reinstalled),
+    then the MAC address, then the hostname (neither guaranteed unique or stable).
+    """
+    for path in _SERIAL_PATHS:
+        serial = _read_text(path).strip("\x00 \n\t").lower()
+        if _usable(serial):
+            return path, serial
+    for line in _read_text("/proc/cpuinfo").splitlines():
+        if line.lower().startswith("serial"):
+            serial = line.split(":", 1)[1].strip().lower()
+            if _usable(serial):
+                return "/proc/cpuinfo", serial
+    machine_id = _read_text("/etc/machine-id").strip().lower()
+    if _usable(machine_id):
+        return "/etc/machine-id", machine_id
+    import uuid
+
+    node = uuid.getnode()
+    if not (node >> 40) & 1:  # this bit set means uuid invented a random value, not a real MAC
+        return "mac", f"{node:012x}"
+    import socket
+
+    return "hostname", socket.gethostname()
+
+
+def device_name(hw_id: str) -> str:
+    """HydroPi-<first DEVICE_HASH_LENGTH hex digits of SHA-256(hw_id)>."""
+    import hashlib
+
+    return f"{BLE_DEVICE_PREFIX}-{hashlib.sha256(hw_id.encode()).hexdigest()[:DEVICE_HASH_LENGTH]}"
+
+
+DEVICE_ID_SOURCE, _DEVICE_ID = hardware_id()
+DEVICE_NAME = device_name(_DEVICE_ID)  # also the Bluetooth advertised name
+
+# Which growing system this Pi belongs to, written to `system_name` on every row (Supabase and
+# BLE). The app builds one system per distinct name, so each Pi needs its own: by default its
+# DEVICE_NAME. Set HYDRO_SYSTEM_NAME in .env for a friendly name such as "Tower A" instead.
+SYSTEM_NAME = os.environ.get("HYDRO_SYSTEM_NAME") or DEVICE_NAME
+
+# Placeholder for the remote `username` column, which no sensor provides. The app shows a
+# signed-in user only the rows tagged with their username, so untagged rows never appear. There
+# are no real accounts yet: every row is tagged with this test user until the app moves to
+# Supabase Auth. Override with SUPABASE_USERNAME in .env.
+SUPABASE_USERNAME = os.environ.get("SUPABASE_USERNAME", "admin")
+
+# Every column a local cycle row becomes remotely. Supabase sync and the BLE server both send
+# exactly these, built by remote_record() below, so the two paths cannot drift apart.
+REMOTE_RECORD_COLUMNS = ("recorded_at", "username", "system_name", *REMOTE_COLUMNS.values())
+
+
+def remote_record(row) -> dict:
+    """One local cycle row as it appears remotely (Supabase and BLE), keyed by remote column
+    names: the time, the username and system name settings, and every mapped sensor value."""
+    import datetime  # local: config is otherwise plain settings
+
+    recorded_at = datetime.datetime.fromtimestamp(row["ts"], tz=datetime.timezone.utc).isoformat()
+    record = {"recorded_at": recorded_at, "username": SUPABASE_USERNAME, "system_name": SYSTEM_NAME}
+    record.update({remote: remote_value(local, row[local]) for local, remote in REMOTE_COLUMNS.items()})
+    return record
+
+
+# --- Backend ---
+# Where readings go: "supabase" (sync.py, the original implementation) or "onem2m" (a oneM2M
+# CSE, see docs/onem2m.md). Exactly one: a oneM2M Pi never writes to Supabase, and a Supabase
+# Pi never touches a CSE. Bluetooth works the same in both.
+BACKEND = os.environ.get("HYDRO_BACKEND", "supabase").strip().lower()
+if BACKEND not in ("supabase", "onem2m"):
+    raise ValueError(f'HYDRO_BACKEND must be "supabase" or "onem2m", not "{BACKEND}"')
+
+# --- oneM2M ---
+# For the proof of concept the CSE is ACME running on this Pi (acme/acme.ini) as an MN-CSE with
+# no registrar yet. Later it registers to an IN-CSE on EC2; this AE's settings stay the same.
+ONEM2M_CSE_URL = os.environ.get("ONEM2M_CSE_URL", "http://127.0.0.1:8080").rstrip("/")
+ONEM2M_CSE_RN = os.environ.get("ONEM2M_CSE_RN", "cse-hydropi")   # the CSEBase resource name
+# Bearer token for this Pi (the CSE stores only its HMAC; see pi/onem2m/make_token.py). HTTP only.
+ONEM2M_TOKEN = os.environ.get("ONEM2M_TOKEN", "")
+
+# How the Pi talks to the CSE:
+#   http  (default) HTTP binding, JSON, bearer token: ONEM2M_CSE_URL above
+#   mqtt  MQTT binding through an MQTT broker, via the gRPB-M2M library (pip install grpb-m2m),
+#         in ONEM2M_SERIALIZATION: pb (Protobuf; the CSE needs gRPB-M2M's ACME patch), json or cbor
+# The app keeps reading the same resources over HTTP/JSON either way.
+ONEM2M_TRANSPORT = os.environ.get("ONEM2M_TRANSPORT", "http").strip().lower()
+if ONEM2M_TRANSPORT not in ("http", "mqtt"):
+    raise ValueError(f'ONEM2M_TRANSPORT must be "http" or "mqtt", not "{ONEM2M_TRANSPORT}"')
+ONEM2M_MQTT_HOST = os.environ.get("ONEM2M_MQTT_HOST", "127.0.0.1")
+ONEM2M_MQTT_PORT = int(os.environ.get("ONEM2M_MQTT_PORT", "1883"))
+# The CSE's ID in MQTT topics (no leading /): id-hydropi for this Pi's CSE (acme/acme.ini),
+# id-in for the cloud IN-CSE
+ONEM2M_CSE_ID = os.environ.get("ONEM2M_CSE_ID", "id-hydropi")
+ONEM2M_SERIALIZATION = os.environ.get("ONEM2M_SERIALIZATION", "pb").strip().lower()
+ONEM2M_RVI = "3"                     # oneM2M release version indicator sent with requests
+ONEM2M_TIMEOUT_S = 5                 # per request; the CSE is local, so slow means unhealthy
+
+# This Pi's AE. The resource name is always DEVICE_NAME (HydroPi-<hash>): unique per board and a
+# valid oneM2M name, unlike a friendly HYDRO_SYSTEM_NAME such as "Tower A", which still travels
+# in every reading's system_name. AE originators must start with "C" (CSE-assigned AE-ID form).
+ONEM2M_AE_RN = DEVICE_NAME
+ONEM2M_ORIGINATOR = os.environ.get("ONEM2M_ORIGINATOR", f"C{DEVICE_NAME}")
+ONEM2M_APP_ID = "NhydroPi"           # AE app-ID; oneM2M requires it to start with N or R
+ONEM2M_LABEL = "type:hydropi"        # the app discovers systems by this label
+
+# Originators that may read and discover this Pi's data (the HydroOS app). Read-only: the
+# access policy grants them RETRIEVE + DISCOVER and nothing else.
+ONEM2M_READER_ORIGINATORS = [
+    o.strip() for o in os.environ.get("ONEM2M_READER_ORIGINATORS", "CHydroOS-app").split(",") if o.strip()
+]
+
+# Readings TimeSeries: one instance per cycle. 5,760 = 2 days at 30 s; the app needs about an
+# hour. Missing-data detection flags a cycle that doesn't arrive within ~2 periods.
+ONEM2M_READINGS_MNI = 5760
+ONEM2M_MISSING_DATA_TIMER_MS = 2 * SAMPLE_INTERVAL_S * 1000
+ONEM2M_VISION_MNI = 1000             # camera.py metrics
+
+# Uploader pacing. The CSE is local, so readings go up within seconds of being stored.
+ONEM2M_UPLOAD_INTERVAL_S = 10
+ONEM2M_UPLOAD_BATCH = 200            # rows per pass, so a long backlog drains in steps
+# When a Pi first switches to oneM2M, rows older than this are not backfilled: the readings
+# TimeSeries only keeps ONEM2M_READINGS_MNI cycles anyway. They stay in SQLite.
+ONEM2M_BACKFILL_S = ONEM2M_READINGS_MNI * SAMPLE_INTERVAL_S
+
+# On-demand requests (phase 1: the Pi polls). The app posts a request into <AE>/requests and the
+# Pi answers in <AE>/responses, labelled rqi:<request id>, from its own SQLite. This reaches data
+# the CSE doesn't hold, e.g. history older than the readings TimeSeries. See onem2m/ondemand.py.
+ONEM2M_REQUESTS_RN = "requests"
+ONEM2M_RESPONSES_RN = "responses"
+# Who may post requests: CREATE in the requests container only (a separate access policy)
+ONEM2M_REQUESTER_ORIGINATORS = ONEM2M_READER_ORIGINATORS
+ONEM2M_REQUEST_POLL_S = 3            # how often the uploader loop checks for requests
+ONEM2M_REQUEST_MAX_AGE_S = 60        # older requests are dropped unanswered: the app gave up
+ONEM2M_REQUEST_MNI = 20              # pending requests the CSE keeps
+ONEM2M_REQUEST_MAX_ROWS = 2000       # most records one request returns (newest kept)
+ONEM2M_RESPONSE_PART_RECORDS = 300   # records per reply part, about 100 KB of JSON
+ONEM2M_RESPONSE_MNI = 50             # reply parts the CSE keeps
+ONEM2M_RESPONSE_MBS = 4_000_000      # bytes the responses container may hold
+ONEM2M_RESPONSE_MIA_S = 300          # reply parts expire after 5 minutes

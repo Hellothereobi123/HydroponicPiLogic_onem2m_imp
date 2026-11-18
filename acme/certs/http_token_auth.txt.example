@@ -1,0 +1,4 @@
+# Copy to http_token_auth.txt (gitignored). One line per accepted bearer token: the token's
+# HMAC-SHA256 keyed with ACME_SECURITY_SECRET, never the token itself. Generate lines with
+#   cd pi && python3 -m onem2m.make_token --secret <ACME_SECURITY_SECRET>
+# Typically two: this Pi's AE (ONEM2M_TOKEN in pi/.env) and the HydroOS app.
